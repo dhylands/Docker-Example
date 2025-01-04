@@ -1,0 +1,153 @@
+#!/bin/bash
+#
+# Install this script somewhere in your PATH.
+#
+# Now you can do something like:
+#
+#   cd to some directory
+#   run-gcc make
+#
+# and it will run `make` inside the docker container.
+
+set -Eeuo pipefail
+
+# By default we assume that the name of this script is the prefix name of the image to run.
+PGM_NAME=$(basename $0)
+IMAGE_NAME=dhylands/gcc:1.0
+
+function usage {
+    cat <<EOF
+Usage: ${PGM_NAME} [-h][-i IMAGE-NAME] commands
+Where:
+    -d              Enables debug tracing of this script
+    -i IMAGE_NAME   Specifies the docker image_name to run
+    -h              Prints this help
+EOF
+}
+
+# Get the top level directory of the worktree we are in.
+function get_worktree_top_level_dir() {
+    # WARN: If we are in a submodule, there will be a super-project that is the
+    # worktree we are after. If not in a submodule, then we are in the worktree
+    # that we want the top level of.
+    # NOTE: The worktree doesn't have to be in in a child directory of the clone.
+    #       It can be elsewhere, including on a different filesystem.
+    if [[ "$(git rev-parse --is-inside-work-tree 2> /dev/null)" == true ]]; then
+        WORKTREE_TOP_LEVEL=$(git rev-parse --show-superproject-working-tree 2> /dev/null)
+        if [[ -z "${WORKTREE_TOP_LEVEL}" ]]; then
+            WORKTREE_TOP_LEVEL=$(git rev-parse --show-toplevel 2> /dev/null)
+        fi
+        echo "${WORKTREE_TOP_LEVEL}"
+    else
+        echo ""
+    fi
+}
+
+# Get the top level directory of the clone related to the worktree.
+function get_clone_top_level_dir() {
+    # Need to find the very top of the clone. This is tricky because you
+    # can't just use something like `git rev-parse --show-toplevel` due to
+    # the fact that, if you are in a submodule, that will return the submodule's
+    # top level and not the clone's toplevel. Thus, start from the top of the
+    # worktree, and then find the Git common directory.
+    WORKTREE_TOP_LEVEL=$(get_worktree_top_level_dir)
+    if [[ -z "${WORKTREE_TOP_LEVEL}" ]]; then
+        echo ""
+        return
+    fi
+    cd "${WORKTREE_TOP_LEVEL}" || (echo "" && return)
+
+    # Now, the GIT common directory holds things like the object store. If this is
+    # a bare repo, it is the top of the clone. If it is a non-bare repo, then
+    # the GIT common directory will point to a subdirectory called .git, and the
+    # top of the clone is its parent.
+    GIT_COMMON_DIR=$(realpath "$(git rev-parse --git-common-dir)")
+
+    # Now, the GIT common directory holds things like the object store. If this is
+    # a bare repo, it is the top of the clone. If it is a non-bare repo, then
+    # the GIT common directory will point to a subdirectory called .git, and the
+    # top of the clone is its parent.
+    if [[ $(basename "${GIT_COMMON_DIR}") == ".git" ]]; then
+        CLONE_TOP_LEVEL=$(dirname "${GIT_COMMON_DIR}")
+    else
+        CLONE_TOP_LEVEL="${GIT_COMMON_DIR}"
+    fi
+
+    echo "${CLONE_TOP_LEVEL}"
+}
+
+
+DEBUG=0
+EXTRA_ENV=""
+while getopts ":di:t:h" opt; do
+    case ${opt} in
+        d)
+            DEBUG=1
+            set -x
+            EXTRA_ENV="--env DEBUG=true"
+            ;;
+        i)
+            IMAGE_NAME=${OPTARG}
+            ;;
+        h)
+            usage
+            exit 1
+            ;;
+
+    esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+USER_PWD=${PWD}
+EXTRA_MOUNT=
+
+CLONE_TOP_LEVEL=$(get_clone_top_level_dir)
+
+if [[ -z "${CLONE_TOP_LEVEL}" ]]; then
+    BUILD_DIR=${USER_PWD}
+else
+    # We always mount the top of the clone. The worktree may or may not be a sub
+    # directory of the clone because worktrees are allowed to live elsewhere, even
+    # on another filesystem. If the worktree is not a child of the clone, then
+    # we also need to mount it.
+    BUILD_DIR="${CLONE_TOP_LEVEL}"
+
+    WORKTREE_TOP_LEVEL=$(get_worktree_top_level_dir)
+    if [[ ! -z "${WORKTREE_TOP_LEVEL}" ]]; then
+        if [[ $(realpath "${WORKTREE_TOP_LEVEL}/") =~ ^${CLONE_TOP_LEVEL}/.* ]]; then
+            EXTRA_MOUNT=""
+        else
+            EXTRA_MOUNT="-v ${WORKTREE_TOP_LEVEL}:${WORKTREE_TOP_LEVEL}"
+        fi
+    fi
+fi
+
+
+TTY_OPT=""
+if [ -t 0 ]; then
+    # We only want to pass in -ti when stdin is a TTY. When running from crontab
+    # or redirecting from a file, then we don't want the -ti option.
+    TTY_OPT=-ti
+fi
+
+# Add the host's serial devices to the container
+SERIAL_DEVICE_OPTS=$(
+    find /dev -name "ttyACM*" -o -name "ttyUSB*" | # Get matching serial devices on each line
+    awk '{print "--device " $0}' |                 # Add --device prefix to each line
+    tr '\n' ' '                                    # Replace newlines with spaces to flatten args
+)
+
+docker run --rm --init ${TTY_OPT} \
+    ${SERIAL_DEVICE_OPTS} \
+    --network host \
+    -v /dev/bus/usb:/dev/bus/usb \
+    -v "${BUILD_DIR}":"${BUILD_DIR}" \
+    ${EXTRA_MOUNT} \
+    ${EXTRA_ENV} \
+    --env "USER_UID=$(id -u)" \
+    --env "USER_GID=$(id -g)" \
+    --env "USER_HOME=${HOME}" \
+    --env "USER_NAME=$(id -n -u)" \
+    --env "USER_GROUP=$(id -n -g)" \
+    --env "USER_PWD=${USER_PWD}" \
+    "${IMAGE_NAME}" "$@"
